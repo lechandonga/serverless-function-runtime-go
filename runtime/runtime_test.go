@@ -154,17 +154,27 @@ func TestTimeoutReleasesSlotAndLateResultIgnored(t *testing.T) {
 	}
 	t.Logf("[业务:迟到结果] 判定: 第一次执行迟到返回被丢弃，slow-1 结论仍为 %s", KindInvokeTimeout)
 
-	// 调用方主动取消归一化为 Canceled。
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-	_, cerr := rt.Invoke(ctx, InvokeRequest{Function: "tfn", CallID: "cancel-1", Timeout: 5 * time.Second})
-	if kindOf(cerr) != KindCanceled {
-		t.Fatalf("输入 tfn/cancel-1 期望 %s，得到 %v", KindCanceled, cerr)
+	// 调用方主动取消归一化为 Canceled。用独立函数/执行器精确构造，
+	// 不依赖前面共享 gate 的释放状态。
+	rtC := NewRuntime()
+	defer rtC.Close()
+	hc := newGate("cancelable")
+	if err := rtC.Register("tfn-c", VersionSpec{Version: "v1", Handler: hc, Concurrency: 1, IdleTimeout: 0}); err != nil {
+		t.Fatal(err)
 	}
-	t.Logf("[业务:主动取消] 输入 tfn/cancel-1；判定: %s", KindCanceled)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelDone := make(chan error, 1)
+	go func() {
+		_, e := rtC.Invoke(ctx, InvokeRequest{Function: "tfn-c", CallID: "cancel-1", Timeout: 5 * time.Second})
+		cancelDone <- e
+	}()
+	<-hc.started // 保证取消发生在执行中，而不是派发前
+	cancel()
+	if cerr := <-cancelDone; kindOf(cerr) != KindCanceled {
+		t.Fatalf("输入 tfn-c/cancel-1 期望 %s，得到 %v", KindCanceled, cerr)
+	}
+	t.Logf("[业务:主动取消] 输入 tfn-c/cancel-1 执行中取消；判定: %s", KindCanceled)
+	hc.release()
 }
 
 // 业务四：空闲实例回收后再次调用自动重建；回收与派发/更新并发无竞争。
@@ -187,24 +197,24 @@ func TestIdleRecycleAndRecreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := rt.Invoke(context.Background(), InvokeRequest{Function: "ifn", CallID: "c1"})
+	res, err := rt.Invoke(context.Background(), InvokeRequest{Function: "ifn", CallID: "c1", Payload: []byte("c1")})
 	if err != nil || string(res.Payload) != "inst1:c1" {
 		t.Fatalf("首次调用应创建 inst1，得到 %+v %v", res, err)
 	}
 	st, _ := rt.Stats("ifn", "v1")
-	if !st.Pool.Idle || created.Load() != 1 {
+	if st.Pool.Idle != 1 || created.Load() != 1 {
 		t.Fatalf("调用结束应有 1 个空闲实例，得到 idle=%v created=%d", st.Pool.Idle, created.Load())
 	}
 	t.Logf("[业务:实例复用] 输入 ifn/c1；判定: 新建实例 inst1 并在结束后空闲保留")
 
 	time.Sleep(120 * time.Millisecond) // 越过 IdleTimeout，等待 reaper 回收
 	st, _ = rt.Stats("ifn", "v1")
-	if st.Pool.Idle {
+	if st.Pool.Idle != 0 {
 		t.Fatal("空闲超时后实例应已回收")
 	}
 	t.Logf("[业务:空闲回收] 判定: 超过 IdleTimeout=50ms 后 Idle=false，实例被回收")
 
-	res, err = rt.Invoke(context.Background(), InvokeRequest{Function: "ifn", CallID: "c2"})
+	res, err = rt.Invoke(context.Background(), InvokeRequest{Function: "ifn", CallID: "c2", Payload: []byte("c2")})
 	if err != nil || string(res.Payload) != "inst2:c2" {
 		t.Fatalf("回收后再次调用应自动新建 inst2，得到 %+v %v", res, err)
 	}
@@ -265,7 +275,7 @@ func TestRecycleDispatchUpdateConcurrent(t *testing.T) {
 		defer wg.Done()
 		for v := 2; v <= 5; v++ {
 			_ = rt.Publish("race", VersionSpec{
-				Version: Version(fmt.Sprintf("v%d", v)),
+				Version:     Version(fmt.Sprintf("v%d", v)),
 				NewInstance: factory, Concurrency: 4, MaxQueueDepth: 16, IdleTimeout: time.Millisecond,
 			})
 		}
@@ -403,8 +413,8 @@ func TestExecutorCrashIsolation(t *testing.T) {
 
 	// 另一个函数完全不受影响。
 	if err := rt.Register("healthy", VersionSpec{
-		Version: "v1",
-		Handler:  HandlerFunc(func(ctx context.Context, p []byte) ([]byte, error) { return []byte("fine"), nil }),
+		Version:     "v1",
+		Handler:     HandlerFunc(func(ctx context.Context, p []byte) ([]byte, error) { return []byte("fine"), nil }),
 		Concurrency: 1,
 	}); err != nil {
 		t.Fatal(err)

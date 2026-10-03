@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -9,11 +10,11 @@ import (
 // 所有变更都在 mu 写锁内“先构建、后提交”，任何非法更新在持锁阶段被拒绝，
 // 不会留下改了一半的中间状态。
 type functionEntry struct {
-	mu       sync.RWMutex
-	name     string
+	mu        sync.RWMutex
+	name      string
 	revisions map[Version]*Revision
-	current  Version
-	pools    map[Version]*instancePool
+	current   Version
+	pools     map[Version]*instancePool
 }
 
 // NewRuntime 创建一个纯本地、进程内的函数运行时。
@@ -30,6 +31,9 @@ type Runtime struct {
 
 	callsMu sync.Mutex
 	calls   map[string]*idempotentEntry
+
+	drainClaim sync.Mutex
+	drain      atomic.Pointer[drainState] // 非 nil 表示正在排空或已完成排空（此后永久拒绝新调用）
 
 	closeOnce sync.Once
 	closed    bool
@@ -71,7 +75,7 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 		return err
 	}
 	if err := validateSpec(spec); err != nil {
-	return err
+		return err
 	}
 	fn, err := rt.lookup(name, "")
 	if err != nil {
@@ -91,6 +95,11 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 	newPools[spec.Version] = newInstancePool(newRev)
 	fn.revisions[spec.Version] = newRev
 	fn.pools = newPools
+	// 旧当前版本不再是路由版本：主动回收其空闲实例，在途调用照旧跑完、
+	// 跑完不再保留。新版本非法时整体拒绝，因此这里的提交不会发生在失败路径。
+	if old := fn.pools[fn.current]; old != nil && fn.current != spec.Version {
+		old.retire()
+	}
 	fn.current = spec.Version
 	return nil
 }
@@ -116,6 +125,9 @@ func (rt *Runtime) DisableVersion(name string, v Version) error {
 		return platformError(KindValidation, name, v, "version already disabled")
 	}
 	rev.disabled = true
+	if pool := fn.pools[v]; pool != nil {
+		pool.retire()
+	}
 	return nil
 }
 
@@ -197,6 +209,9 @@ func validateSpec(spec VersionSpec) error {
 	}
 	if spec.IdleTimeout < 0 {
 		return platformError(KindValidation, "", spec.Version, "idle timeout must be >= 0")
+	}
+	if spec.MaxIdleInstances != nil && *spec.MaxIdleInstances < 0 {
+		return platformError(KindValidation, "", spec.Version, "max idle instances must be >= 0")
 	}
 	return nil
 }

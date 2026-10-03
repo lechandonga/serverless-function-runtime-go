@@ -38,15 +38,22 @@ type VersionSpec struct {
 	MaxQueueDepth int
 	// IdleTimeout 实例空闲多久后回收；0 表示立即回收（每次调用新建）。
 	IdleTimeout time.Duration
+	// MaxIdleInstances 配置该版本最多保留多少个空闲实例。
+	//   - 留空（nil）：保持默认行为（空闲未超时的实例最多保留 1 个暖实例）；
+	//   - 显式 0：用完即回收，不保留任何空闲实例（即使 IdleTimeout>0）；
+	//   - 显式 N（>=1）：高并发回落后最多保留 N 个空闲实例，多出的立即销毁；
+	//     每个空闲实例仍各自受 IdleTimeout 约束，超时即回收。
+	// 负数属于非法配置，发布会被整体拒绝，老版本与路由不受影响。
+	MaxIdleInstances *int
 }
 
 // Revision 是注册表中一个不可变版本。发布后永不原地修改，
 // 更新函数只会新增 revision 或调整路由/启停状态，
 // 因此已经开始的调用始终持有它开始那一刻的 revision 指针。
 type Revision struct {
-	spec      VersionSpec
+	spec        VersionSpec
 	publishedAt time.Time
-	disabled   bool
+	disabled    bool
 }
 
 func (r *Revision) Spec() VersionSpec { return r.spec }
@@ -67,7 +74,7 @@ type InvokeRequest struct {
 type InvokeResult struct {
 	Function string
 	Version  Version
-	Payload []byte
+	Payload  []byte
 	// Attempted 为 true 表示执行器被真正派发执行过（哪怕最终失败）。
 	Attempted bool
 	Duration  time.Duration
