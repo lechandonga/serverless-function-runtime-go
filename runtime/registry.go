@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -9,11 +10,11 @@ import (
 // 所有变更都在 mu 写锁内“先构建、后提交”，任何非法更新在持锁阶段被拒绝，
 // 不会留下改了一半的中间状态。
 type functionEntry struct {
-	mu       sync.RWMutex
-	name     string
+	mu        sync.RWMutex
+	name      string
 	revisions map[Version]*Revision
-	current  Version
-	pools    map[Version]*instancePool
+	current   Version
+	pools     map[Version]*instancePool
 }
 
 // NewRuntime 创建一个纯本地、进程内的函数运行时。
@@ -33,6 +34,11 @@ type Runtime struct {
 
 	closeOnce sync.Once
 	closed    bool
+
+	drainMu      sync.Mutex
+	draining     atomic.Bool
+	drainDone    chan struct{}
+	drainSummary *DrainSummary
 }
 
 // Register 注册一个新函数并发布首个版本，同时把它设为当前版本。
@@ -48,6 +54,9 @@ func (rt *Runtime) Register(name string, spec VersionSpec) error {
 	defer rt.mu.Unlock()
 	if rt.closed {
 		return platformError(KindValidation, name, spec.Version, "runtime is closed")
+	}
+	if rt.draining.Load() {
+		return platformError(KindDraining, name, spec.Version, "runtime is draining and accepts no new invocations")
 	}
 	if _, ok := rt.functions[name]; ok {
 		return platformError(KindValidation, name, spec.Version, "function already registered")
@@ -71,7 +80,7 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 		return err
 	}
 	if err := validateSpec(spec); err != nil {
-	return err
+		return err
 	}
 	fn, err := rt.lookup(name, "")
 	if err != nil {
@@ -82,16 +91,27 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 	if _, ok := fn.revisions[spec.Version]; ok {
 		return platformError(KindValidation, name, spec.Version, "version already exists")
 	}
+	if rt.draining.Load() {
+		return platformError(KindDraining, name, spec.Version, "runtime is draining and accepts no new invocations")
+	}
 	// 先构建完整新状态，再一次性提交。
 	newRev := &Revision{spec: spec, publishedAt: time.Now()}
 	newPools := make(map[Version]*instancePool, len(fn.pools)+1)
+	prev := fn.current
 	for k, v := range fn.pools {
 		newPools[k] = v
 	}
-	newPools[spec.Version] = newInstancePool(newRev)
+	newPools[spec.Version] = newInstancePool(name, newRev)
 	fn.revisions[spec.Version] = newRev
 	fn.pools = newPools
 	fn.current = spec.Version
+	// 此前的当前版本不再是路由版本：主动回收其空闲实例，在途调用照旧跑完。
+	// 只有真正被顶替下来的“旧当前版本”才退场；其余非当前版本状态不变。
+	if prev != spec.Version {
+		if old, ok := newPools[prev]; ok {
+			old.retire()
+		}
+	}
 	return nil
 }
 
@@ -116,6 +136,10 @@ func (rt *Runtime) DisableVersion(name string, v Version) error {
 		return platformError(KindValidation, name, v, "version already disabled")
 	}
 	rev.disabled = true
+	// 停用即退场：空闲实例立即回收，跑完的那份不再保留。
+	if pool, ok := fn.pools[v]; ok {
+		pool.retire()
+	}
 	return nil
 }
 
@@ -153,7 +177,7 @@ func (rt *Runtime) resolve(name string, v Version) (*Revision, *instancePool, er
 	}
 	pool, ok := fn.pools[v]
 	if !ok {
-		pool = newInstancePool(rev)
+		pool = newInstancePool(name, rev)
 		fn.pools[v] = pool
 	}
 	return rev, pool, nil
@@ -197,6 +221,9 @@ func validateSpec(spec VersionSpec) error {
 	}
 	if spec.IdleTimeout < 0 {
 		return platformError(KindValidation, "", spec.Version, "idle timeout must be >= 0")
+	}
+	if spec.MaxIdleInstances != nil && *spec.MaxIdleInstances < 0 {
+		return platformError(KindValidation, "", spec.Version, "max idle instances must be >= 0 or left unset")
 	}
 	return nil
 }

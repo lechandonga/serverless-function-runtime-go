@@ -24,6 +24,12 @@ const (
 	KindInvokeTimeout ErrorKind = "InvokeTimeout"
 	// KindCanceled 调用方在得到结论前主动取消了调用。
 	KindCanceled ErrorKind = "Canceled"
+	// KindDraining 运行时正在优雅排空：不再接受新调用，或调用在队列中
+	// 等到排空开始而未被派发。与过载/超时/停用都不同。
+	KindDraining ErrorKind = "Draining"
+	// KindDrainInterrupted 调用已在执行，排空宽限期用尽仍未结束，
+	// 被强制中断。与普通执行超时、调用方取消都不同。
+	KindDrainInterrupted ErrorKind = "DrainInterrupted"
 	// KindExecutorFailed 执行器正常返回了一个业务错误。
 	KindExecutorFailed ErrorKind = "ExecutorFailed"
 	// KindExecutorCrashed 执行器发生 panic / 崩溃，被平台兜底恢复。
