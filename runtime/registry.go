@@ -92,7 +92,7 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 	for k, v := range fn.pools {
 		newPools[k] = v
 	}
-	newPools[spec.Version] = newInstancePool(newRev)
+	newPools[spec.Version] = newInstancePool(newRev, &rt.drain)
 	fn.revisions[spec.Version] = newRev
 	fn.pools = newPools
 	// 旧当前版本不再是路由版本：主动回收其空闲实例，在途调用照旧跑完、
@@ -165,7 +165,12 @@ func (rt *Runtime) resolve(name string, v Version) (*Revision, *instancePool, er
 	}
 	pool, ok := fn.pools[v]
 	if !ok {
-		pool = newInstancePool(rev)
+		pool = newInstancePool(rev, &rt.drain)
+		// 若排空已抢先发布，新池从诞生起就是排空态：某个版本的第一批
+		// 调用与排空撞在一起时，也不可能穿过 resolve 获得派发。
+		if d := rt.currentDrain(); d != nil {
+			pool.adoptDrainIfNeeded(d)
+		}
 		fn.pools[v] = pool
 	}
 	return rev, pool, nil

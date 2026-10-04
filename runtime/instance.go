@@ -42,6 +42,11 @@ type instancePool struct {
 	flights  map[*flight]struct{} // 已真正派发、仍在途的调用
 	retired  bool                 // 版本退场（停用/不再是当前版本）：跑完即回收
 	draining bool
+	drain    *drainState // 所属排空；非 nil 时飞行终结要回权威计数
+	// drainGlobal 指向 Runtime 的全局排空原子指针；池内任何早退路径都
+	// 直接读它，覆盖“排空已发布、本池尚未 beginDrain 认领”的窗口，
+	// 不靠逐池广播，因此不存在漏成 Overloaded 的时序。
+	drainGlobal *atomic.Pointer[drainState]
 
 	created   atomic.Int64
 	destroyed atomic.Int64
@@ -55,10 +60,11 @@ type idleEntry struct {
 }
 
 type waiter struct {
-	ch      chan struct{}
-	ctx     context.Context
-	dead    bool
-	drained bool // 被排空清队：拒绝数由池方权威统计，调用方不再累加
+	ch       chan struct{}
+	ctx      context.Context
+	dead     bool
+	drained  bool // 被排空清队：拒绝数由池方权威统计，调用方不再累加
+	enqueued bool // 是否仍挂在队列里：被唤醒者先出队，落败再挂回
 }
 
 type poolToken struct {
@@ -66,8 +72,8 @@ type poolToken struct {
 	inst *instance
 }
 
-func newInstancePool(rev *Revision) *instancePool {
-	return &instancePool{rev: rev, flights: map[*flight]struct{}{}}
+func newInstancePool(rev *Revision, global *atomic.Pointer[drainState]) *instancePool {
+	return &instancePool{rev: rev, flights: map[*flight]struct{}{}, drainGlobal: global}
 }
 
 // maxIdle 返回该版本生效的空闲实例保留数。
@@ -80,11 +86,13 @@ func (p *instancePool) maxIdle() int {
 }
 
 // beginDrain 进入排空态：不再派发，并立即清空等待队列。
-// 被清除的等待者由 acquire 侧按排空原因结束。可重复、可并发调用。
-func (p *instancePool) beginDrain() (queued int, flights []*flight) {
+// 被清除的等待者由 acquire 侧按排空原因结束。drain 状态与快照在同一把锁内
+// 提交，因此返回的 flights 精确等于“排空开始那一刻已真正在执行”的集合。
+func (p *instancePool) beginDrain(d *drainState) (queued int, flights []*flight) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.draining = true
+	p.drain = d
 	queued = len(p.waiters)
 	for _, w := range p.waiters {
 		w.dead = true
@@ -96,6 +104,19 @@ func (p *instancePool) beginDrain() (queued int, flights []*flight) {
 		flights = append(flights, f)
 	}
 	return queued, flights
+}
+
+// adoptDrainIfNeeded 用于“排空已发布之后才被解析/创建出来”的池：
+// 它从诞生第一刻起就是排空态，第一批调用也不可能溜进去执行。
+func (p *instancePool) adoptDrainIfNeeded(d *drainState) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d == nil || p.draining {
+		return p.draining
+	}
+	p.draining = true
+	p.drain = d
+	return true
 }
 
 // retire 标记版本退场：空闲实例立即回收，在途调用跑完后不再保留。
@@ -112,62 +133,82 @@ func (p *instancePool) acquire(ctx context.Context) (*flight, error) {
 	spec := p.rev.spec
 
 	p.mu.Lock()
-	if p.draining {
-		err := platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
-		p.mu.Unlock()
-		return nil, err
-	}
-	// 有空闲容量即可派发；空闲实例若已被 reaper 标记回收则新建。
-	if f, ok := p.tryDispatchLocked(); ok {
-		p.mu.Unlock()
-		return f, nil
-	}
-	// 并发已满：尝试排队。
-	if spec.MaxQueueDepth == 0 || len(p.waiters) >= spec.MaxQueueDepth {
-		err := platformError(KindOverload, "", p.rev.spec.Version,
-			"concurrency=%d full and queue depth=%d exhausted", spec.Concurrency, spec.MaxQueueDepth)
-		p.mu.Unlock()
-		return nil, err
-	}
-	w := &waiter{ch: make(chan struct{}), ctx: ctx}
-	p.waiters = append(p.waiters, w)
-	p.mu.Unlock()
-
-	select {
-	case <-w.ch:
-		// release/drain 方唤醒后，这里再次持锁检查并创建/复用实例。
-		p.mu.Lock()
-		if w.dead {
-			draining := p.draining
-			drained := w.drained
+	var w *waiter
+	for {
+		// 本地排空认领与全局排空发布，任一成立都立即拒绝；
+		// 全部判定都在池锁内，不存在“发布与出锁”之间的漏网窗口。
+		if d := p.drain; d != nil {
+			d.newRejected.Add(1)
 			p.mu.Unlock()
-			if draining && drained {
-				return nil, drainingQueuedSentinel
-			}
-			if draining {
-				return nil, platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
-			}
-			// 极端竞态：等待者已超时退出，槽位没有真正交给它。
-			return nil, ctx.Err()
+			return nil, drainingQueuedSentinel
 		}
-		if p.draining {
+		if gd := p.drainGlobal.Load(); gd != nil {
+			gd.newRejected.Add(1)
 			p.mu.Unlock()
 			return nil, platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
 		}
-		f, ok := p.tryDispatchLocked()
-		if !ok {
-			// 理论不可达：被唤醒必然有空闲槽；保守处理为过载。
+		// 有空闲容量即可派发；空闲实例若已被 reaper 标记回收则新建。
+		if f, ok := p.tryDispatchLocked(); ok {
 			p.mu.Unlock()
-			return nil, platformError(KindOverload, "", spec.Version, "woken but no slot available")
+			return f, nil
+		}
+		if w == nil {
+			// 首次到达：满载才排队；队列也满则过载（锁内已确认未排空）。
+			if spec.MaxQueueDepth == 0 || len(p.waiters) >= spec.MaxQueueDepth {
+				ver := p.rev.spec.Version
+				p.mu.Unlock()
+				return nil, platformError(KindOverload, "", ver,
+					"concurrency=%d full and queue depth=%d exhausted", spec.Concurrency, spec.MaxQueueDepth)
+			}
+			w = &waiter{ch: make(chan struct{}), ctx: ctx, enqueued: true}
+			p.waiters = append(p.waiters, w)
 		}
 		p.mu.Unlock()
-		return f, nil
-	case <-ctx.Done():
-		p.mu.Lock()
-		w.dead = true
-		p.removeWaiterLocked(w)
-		p.mu.Unlock()
-		return nil, ctx.Err()
+
+		select {
+		case <-w.ch:
+			// 被 release 唤醒：重新持锁。若排空恰在此刻发布，
+			// 必须在此分支先检查（不会再走循环顶部）；槽位被其他等待者
+			// 先行拿走（唤醒与抢锁之间）时 w 仍存活，回队继续等。
+			p.mu.Lock()
+			if d := p.drain; d != nil {
+				w.dead = true
+				p.mu.Unlock()
+				return nil, drainingQueuedSentinel
+			}
+			if gd := p.drainGlobal.Load(); gd != nil {
+				gd.newRejected.Add(1)
+				w.dead = true
+				p.mu.Unlock()
+				return nil, platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
+			}
+			if w.dead {
+				draining := p.draining || p.drainGlobal.Load() != nil
+				p.mu.Unlock()
+				if draining {
+					return nil, drainingQueuedSentinel
+				}
+				return nil, ctx.Err()
+			}
+			// wakeOne 已把 w 移出队列。先尝试当场领取槽位；
+			// 抢锁落败（槽位已被更早被唤醒的等待者拿走）则换新唤醒
+			// 通道、重新挂回队尾，旧通道不再使用，杜绝重复 close。
+			if f, ok := p.tryDispatchLocked(); ok {
+				p.mu.Unlock()
+				return f, nil
+			}
+			w.ch = make(chan struct{})
+			w.enqueued = true
+			p.waiters = append(p.waiters, w)
+			p.mu.Unlock()
+			continue
+		case <-ctx.Done():
+			p.mu.Lock()
+			w.dead = true
+			p.removeWaiterLocked(w)
+			p.mu.Unlock()
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -227,6 +268,11 @@ func (p *poolToken) release(f *flight, crashed bool) {
 	pool.mu.Lock()
 	pool.active--
 	delete(pool.flights, f)
+	if pool.drain != nil {
+		// 排空已认领本池：该 flight 必然在 beginDrain 的在途快照里
+		//（排空在锁内认领，快照之后不可能再有新派发），自然终结计入跑完。
+		pool.drain.completed.Add(1)
+	}
 
 	reuse := !crashed && !pool.retired && !pool.draining
 	spec := pool.rev.spec
@@ -261,6 +307,26 @@ func (p *poolToken) detach(f *flight) {
 	pool.detached++
 	p.inst.closed = true
 	delete(pool.flights, f)
+	if pool.drain != nil {
+		// 在排空宽限集合里的在途调用，因自身超时/取消取得结论（而非被
+		// 排空强制中断）：对排空而言它在宽限期内有了定论，计入跑完侧，
+		// 保证 跑完+中断 与快照中的在途调用一一对应、无遗漏。
+		pool.drain.completed.Add(1)
+	}
+	pool.wakeOneLocked()
+	pool.mu.Unlock()
+}
+
+// detachForDrain 是排空宽限期到点的强制解绑：与普通超时/取消解绑相同，
+// 额外把该在途调用权威计入“中断”。与 release/complete 互斥，恰好一次。
+func (p *poolToken) detachForDrain(f *flight, d *drainState) {
+	pool := p.pool
+	pool.mu.Lock()
+	pool.active--
+	pool.detached++
+	p.inst.closed = true
+	delete(pool.flights, f)
+	d.interrupted.Add(1)
 	pool.wakeOneLocked()
 	pool.mu.Unlock()
 }
@@ -332,14 +398,17 @@ func (p *instancePool) dropAllIdleLocked() {
 
 // Stats 供测试与可观测性使用。
 type Stats struct {
-	Active      int
-	Idle        int
-	Detached    int
-	QueueLength int
-	Created     int64
-	Destroyed   int64
-	Retired     bool
-	Draining    bool
+	Active int
+	Idle   bool // 兼容字段：该版本当前是否存在至少一个空闲实例（历史语义）
+	// IdleInstances 是当前空闲实例的具体数量；需要数值时使用本字段，
+	// 不要把 Idle 当数字用。
+	IdleInstances int
+	Detached      int
+	QueueLength   int
+	Created       int64
+	Destroyed     int64
+	Retired       bool
+	Draining      bool
 }
 
 // 账目不变量：Created - Destroyed == Active + Idle + Detached。
@@ -353,13 +422,14 @@ func (p *instancePool) stats() Stats {
 		}
 	}
 	return Stats{
-		Active:      p.active,
-		Idle:        idle,
-		Detached:    p.detached,
-		QueueLength: len(p.waiters),
-		Created:     p.created.Load(),
-		Destroyed:   p.destroyed.Load(),
-		Retired:     p.retired,
-		Draining:    p.draining,
+		Active:        p.active,
+		Idle:          idle > 0,
+		IdleInstances: idle,
+		Detached:      p.detached,
+		QueueLength:   len(p.waiters),
+		Created:       p.created.Load(),
+		Destroyed:     p.destroyed.Load(),
+		Retired:       p.retired,
+		Draining:      p.draining,
 	}
 }

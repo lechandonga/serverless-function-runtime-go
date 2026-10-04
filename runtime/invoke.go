@@ -31,14 +31,15 @@ type flight struct {
 	finished    bool
 	done        chan struct{}
 	interruptCh chan struct{}
+	drain       *drainState // 排空认领：本在途调用属于哪一次排空的宽限集合
 }
 
 func newFlight(tok *poolToken) *flight {
 	return &flight{tok: tok, done: make(chan struct{}), interruptCh: make(chan struct{})}
 }
 
-// complete 由自然结束路径调用：终结 token 并标记结束，幂等。
-func (f *flight) complete(crashed bool) bool {
+// finish 终结 flight 并返回 true；已终结（自然结束/强制中断竞争落败）返回 false。
+func (f *flight) finish() bool {
 	f.mu.Lock()
 	if f.finished {
 		f.mu.Unlock()
@@ -47,23 +48,41 @@ func (f *flight) complete(crashed bool) bool {
 	f.finished = true
 	close(f.interruptCh)
 	f.mu.Unlock()
+	return true
+}
+
+// complete 由自然结束路径调用：终结 token 并标记结束，幂等。
+// 排空计数由 pool.release 在池锁内权威完成，不依赖谁先观测到结束。
+func (f *flight) complete(crashed bool) bool {
+	if !f.finish() {
+		return false
+	}
 	f.tok.release(f, crashed)
 	close(f.done)
 	return true
 }
 
-// interrupt 由排空调度：载体与调用解绑，槽位立即归还；
+// interrupt 由普通超时/取消路径调用：载体与调用解绑，槽位立即归还；
 // 执行 goroutine 的迟到结果无人接收，不能改变任何结论。
-func (f *flight) interrupt() bool {
-	f.mu.Lock()
-	if f.finished {
-		f.mu.Unlock()
+// 若该调用属于某次排空且尚在宽限集合中，它在排空看来仍是“宽限期内
+// 自然有了结论”（超时/取消是调用自身结论），由 release 侧语义之外的
+// detach 路径不计数；只有 forceDrainInterrupt 才计入中断。
+func (f *flight) interrupt() {
+	if !f.finish() {
+		return
+	}
+	f.tok.detach(f)
+	close(f.done)
+}
+
+// forceDrainInterrupt 由排空调度：载体与调用解绑，槽位立即归还，
+// 并权威计入排空“中断”。执行 goroutine 的迟到结果无人接收，不能翻案。
+// 返回 false 表示调用已先一步自然终结（已计入跑完），排空不再处理。
+func (f *flight) forceDrainInterrupt(d *drainState) bool {
+	if !f.finish() {
 		return false
 	}
-	f.finished = true
-	close(f.interruptCh)
-	f.mu.Unlock()
-	f.tok.detach(f)
+	f.tok.detachForDrain(f, d)
 	close(f.done)
 	return true
 }
@@ -90,6 +109,8 @@ type DrainSummary struct {
 type drainState struct {
 	newRejected    atomic.Int64
 	queuedRejected atomic.Int64
+	completed      atomic.Int64
+	interrupted    atomic.Int64
 
 	finish  chan struct{} // 排空完成，summary 可读
 	summary DrainSummary
@@ -102,16 +123,57 @@ func newDrainState() *drainState {
 // Invoke 同步调用一个函数。语义见包文档：
 // 超时/排队失败/崩溃等全部归一化为 *PlatformError。
 func (rt *Runtime) Invoke(ctx context.Context, req InvokeRequest) (*InvokeResult, error) {
+	// 排空闸口必须先于幂等回放：只要排空已发布（含已结束），
+	// 任何提交——无论 CallID 是否重复、无论结论是否已缓存——
+	// 都立即得到同一种 KindDraining 拒绝，旧成功结论不得回放。
+	if rt.rejectIfDraining() {
+		return nil, platformError(KindDraining, req.Function, req.Version,
+			"runtime is draining and accepts no new invocations")
+	}
 	if req.CallID != "" {
 		entry, first := rt.joinOrCreate(req.CallID)
 		if !first {
-			return rt.waitForEntry(ctx, entry)
+			res, err := rt.waitForEntry(ctx, entry)
+			return rt.gateDrainingResult(req, res, err)
 		}
 		res, err := rt.doInvoke(ctx, req)
 		rt.finishEntry(req.CallID, entry, res, err)
+		return rt.gateDrainingResult(req, res, err)
+	}
+	res, err := rt.doInvoke(ctx, req)
+	return rt.gateDrainingResult(req, res, err)
+}
+
+// gateDrainingResult 是调用方拿到结论前的最后一道闸口：
+// 提交在排空发布之前已进入池路径，但其早退错误（典型为过载）恰好在
+// Drain 发起前后才形成。对调用方而言它是“排空发起后才得到结论的提交”，
+// 必须与其他排空后提交完全一致，返回同一种 KindDraining。
+// 成功结果或 KindDraining 本身不做改写。
+func (rt *Runtime) gateDrainingResult(req InvokeRequest, res *InvokeResult, err error) (*InvokeResult, error) {
+	if err == nil {
+		return res, nil
+	}
+	pe, ok := err.(*PlatformError)
+	if !ok {
 		return res, err
 	}
-	return rt.doInvoke(ctx, req)
+	switch pe.Kind {
+	case KindDraining:
+		return res, err
+	case KindDrainInterrupted, KindInvokeTimeout, KindCanceled, KindExecutorFailed, KindExecutorCrashed:
+		// 调用已经真正派发执行：无论结论何时形成，都是“在途调用的真实结论”，
+		// 绝不能被排空闸口改写（否则中断数会被吞掉）。
+		return res, err
+	}
+	// 其余（典型 KindOverload/KindQueueTimeout）属于“未派发即失败”的早退：
+	// 只要调用方取得结论时排空已经发起，它就是排空发起后的提交，
+	// 统一归一化为同一种 KindDraining。
+	if d := rt.currentDrain(); d != nil {
+		d.newRejected.Add(1)
+		return nil, platformError(KindDraining, req.Function, req.Version,
+			"runtime is draining and accepts no new invocations")
+	}
+	return res, err
 }
 
 func (rt *Runtime) currentDrain() *drainState {
@@ -157,14 +219,15 @@ func (rt *Runtime) finishEntry(callID string, e *idempotentEntry, res *InvokeRes
 func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest) (*InvokeResult, error) {
 	started := time.Now()
 
-	if rt.rejectIfDraining() {
-		return nil, platformError(KindDraining, req.Function, req.Version,
-			"runtime is draining and accepts no new invocations")
-	}
-
 	rev, pool, err := rt.resolve(req.Function, req.Version)
 	if err != nil {
 		return nil, err
+	}
+	// resolve 可能与排空发布并发：池在锁内二次确认，排空后才解析/
+	// 创建出来的池（包括某版本的第一批调用）同样一律拒绝。
+	if rt.rejectIfDraining() {
+		return nil, platformError(KindDraining, req.Function, rev.spec.Version,
+			"runtime is draining and accepts no new invocations")
 	}
 
 	ctx, cancel := context.WithCancel(parent)

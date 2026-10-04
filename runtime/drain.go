@@ -44,51 +44,44 @@ func (rt *Runtime) runDrain(d *drainState, gracePeriod time.Duration) {
 	var inflight []*flight
 	for _, fn := range rt.snapshotFunctions() {
 		for _, pool := range fn.snapshotPools() {
-			n, flights := pool.beginDrain()
+			n, flights := pool.beginDrain(d)
 			queued += int64(n)
 			inflight = append(inflight, flights...)
 		}
 	}
 	d.queuedRejected.Store(queued)
 
-	// 2) 宽限期：在途调用全部自然跑完则提前收尾；否则用到点时刻
-	//    仍未关闭 done 的 flight 作为“被中断”集合。
-	deadline := time.Now().Add(gracePeriod)
-	timedOut := false
-	for len(inflight) > 0 {
+	// 2) 宽限期：在途调用全部有了结论（自然跑完 / 自身超时取消）则提前
+	//    收尾；否则到点统一强制中断。计数不在这里临时清点：自然终结由
+	//    pool.release 在池锁内权威累加 completed，强制中断由
+	//    detachForDrain 权威累加 interrupted，两条路径互斥、恰好一次，
+	//    因此“收尾瞬间刚好结束”“排空生效后很快结束”都不会两边漏计。
+	if len(inflight) > 0 {
 		allDone := make(chan struct{})
-		go func(flights []*flight) {
-			for _, f := range flights {
+		go func() {
+			for _, f := range inflight {
 				<-f.done
 			}
 			close(allDone)
-		}(inflight)
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			timedOut = true
-			break
-		}
-		timer := time.NewTimer(wait)
-		select {
-		case <-allDone:
-			timer.Stop()
-		case <-timer.C:
-			timedOut = true
-		}
-		break // 要么全完，要么到点；到点时未完成的由下一步统一中断
-	}
-
-	// 3) 到点仍未跑完的：强制结论并解绑。解绑是同步的，槽位当场归还，
-	//    不等待执行器响应取消，排空绝不被赖着不走的执行器拖住。
-	var completed, interrupted int64
-	if timedOut {
-		for _, f := range inflight {
-			if f.interrupt() {
-				interrupted++
+		}()
+		if gracePeriod <= 0 {
+			for _, f := range inflight {
+				f.forceDrainInterrupt(d)
+			}
+		} else {
+			timer := time.NewTimer(gracePeriod)
+			select {
+			case <-allDone:
+				timer.Stop()
+			case <-timer.C:
+				// 3) 到点仍未跑完的：强制结论并解绑。解绑同步完成，槽位当场
+				//    归还，不等待执行器响应取消，排空绝不被赖着的执行器拖住。
+				//    forceDrainInterrupt 与自然终结互斥，恰好在一个计数里落账。
+				for _, f := range inflight {
+					f.forceDrainInterrupt(d)
+				}
 			}
 		}
-	} else {
-		completed = int64(len(inflight))
 	}
 
 	// 4) 资源清零：空闲实例与定时器全部销毁；active 此刻恒为 0。
@@ -104,8 +97,8 @@ func (rt *Runtime) runDrain(d *drainState, gracePeriod time.Duration) {
 	}
 
 	d.summary = DrainSummary{
-		Completed:         completed,
-		Interrupted:       interrupted,
+		Completed:         d.completed.Load(),
+		Interrupted:       d.interrupted.Load(),
 		QueuedRejected:    d.queuedRejected.Load(),
 		NewRejected:       d.newRejected.Load(),
 		RemainingActive:   activeLeft,

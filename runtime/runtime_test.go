@@ -202,14 +202,14 @@ func TestIdleRecycleAndRecreate(t *testing.T) {
 		t.Fatalf("首次调用应创建 inst1，得到 %+v %v", res, err)
 	}
 	st, _ := rt.Stats("ifn", "v1")
-	if st.Pool.Idle != 1 || created.Load() != 1 {
-		t.Fatalf("调用结束应有 1 个空闲实例，得到 idle=%v created=%d", st.Pool.Idle, created.Load())
+	if st.Pool.IdleInstances != 1 || created.Load() != 1 {
+		t.Fatalf("调用结束应有 1 个空闲实例，得到 idle=%v created=%d", st.Pool.IdleInstances, created.Load())
 	}
 	t.Logf("[业务:实例复用] 输入 ifn/c1；判定: 新建实例 inst1 并在结束后空闲保留")
 
 	time.Sleep(120 * time.Millisecond) // 越过 IdleTimeout，等待 reaper 回收
 	st, _ = rt.Stats("ifn", "v1")
-	if st.Pool.Idle != 0 {
+	if st.Pool.IdleInstances != 0 {
 		t.Fatal("空闲超时后实例应已回收")
 	}
 	t.Logf("[业务:空闲回收] 判定: 超过 IdleTimeout=50ms 后 Idle=false，实例被回收")

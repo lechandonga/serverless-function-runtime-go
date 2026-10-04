@@ -24,8 +24,8 @@ func TestMaxIdleInstancesConfiguration(t *testing.T) {
 		}
 		runN(t, rt, "rdef", 3)
 		st := assertLedger(t, "默认保留1", "rdef/v1", rt, "rdef", "v1")
-		if st.Idle != 1 {
-			t.Fatalf("默认策略高并发回落后应只保留 1 个空闲实例，得到 %d", st.Idle)
+		if st.IdleInstances != 1 {
+			t.Fatalf("默认策略高并发回落后应只保留 1 个空闲实例，得到 %d", st.IdleInstances)
 		}
 		t.Logf("[业务:保留默认] 输入 rdef 并发3 回落；判定: Idle=1（历史行为不变）")
 	})
@@ -44,7 +44,7 @@ func TestMaxIdleInstancesConfiguration(t *testing.T) {
 		}
 		runN(t, rt, "r0", 3)
 		st := assertLedger(t, "零保留", "r0/v1", rt, "r0", "v1")
-		if st.Idle != 0 || st.Created != 3 || st.Destroyed != 3 {
+		if st.IdleInstances != 0 || st.Created != 3 || st.Destroyed != 3 {
 			t.Fatalf("MaxIdleInstances=0 应用完即回收，得到 %+v", st)
 		}
 		t.Logf("[业务:零保留] 输入 r0 MaxIdleInstances=0；判定: Idle=0 created=3 destroyed=3")
@@ -88,7 +88,7 @@ func TestMaxIdleInstancesConfiguration(t *testing.T) {
 		wg.Wait()
 
 		st := assertLedger(t, "保留N", "rN/v1", rt, "rN", "v1")
-		if st.Idle != 2 || st.Created != 4 || st.Destroyed != 2 {
+		if st.IdleInstances != 2 || st.Created != 4 || st.Destroyed != 2 {
 			t.Fatalf("MaxIdleInstances=2 回落应保留2、销毁2，得到 %+v", st)
 		}
 		t.Logf("[业务:保留N] 输入 rN 并发4 MaxIdleInstances=2；判定: Idle=2，多出2个立即销毁，created=4 destroyed=2")
@@ -107,7 +107,7 @@ func TestMaxIdleInstancesConfiguration(t *testing.T) {
 		}
 		wg2.Wait()
 		st = assertLedger(t, "N内复用", "rN/v1", rt, "rN", "v1")
-		if st.Idle != 2 || st.Created != 4 {
+		if st.IdleInstances != 2 || st.Created != 4 {
 			t.Fatalf("回落再调用应复用空闲实例不新建，得到 %+v", st)
 		}
 		t.Logf("[业务:N内复用] 判定: 再次回落复用 2 个空闲实例，created 仍=4，Idle=2")
@@ -162,8 +162,8 @@ func TestVersionRetirementReclaimsIdle(t *testing.T) {
 	}
 	runN(t, rt, "retfn", 3)
 	st, _ := rt.Stats("retfn", "v1")
-	if st.Pool.Idle != 1 {
-		t.Fatalf("准备条件：v1 应有 1 个空闲实例，得到 %d", st.Pool.Idle)
+	if st.Pool.IdleInstances != 1 {
+		t.Fatalf("准备条件：v1 应有 1 个空闲实例，得到 %d", st.Pool.IdleInstances)
 	}
 
 	// 在途 v1 调用：发布 v2 后仍按 v1 跑完，但跑完不再保留。
@@ -210,8 +210,8 @@ func TestVersionRetirementReclaimsIdle(t *testing.T) {
 		t.Fatalf("退场版本的在途调用应照常跑完: %v", e)
 	}
 	st1, _ = rt2.Stats("ret2", "v1")
-	if st1.Pool.Idle != 0 {
-		t.Fatalf("退场版本在途调用跑完后不得保留空闲实例，Idle=%d", st1.Pool.Idle)
+	if st1.Pool.IdleInstances != 0 {
+		t.Fatalf("退场版本在途调用跑完后不得保留空闲实例，Idle=%d", st1.Pool.IdleInstances)
 	}
 	t.Logf("[业务:退场在途跑完即毁] 输入 ret2/v1/hold；判定: 正常跑完但不留空闲，Idle=0")
 
@@ -223,8 +223,8 @@ func TestVersionRetirementReclaimsIdle(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldSt, _ := rt.Stats("retfn", "v1")
-	if oldSt.Pool.Idle != 0 {
-		t.Fatalf("路由切走后 v1 空闲实例应被主动回收，Idle=%d", oldSt.Pool.Idle)
+	if oldSt.Pool.IdleInstances != 0 {
+		t.Fatalf("路由切走后 v1 空闲实例应被主动回收，Idle=%d", oldSt.Pool.IdleInstances)
 	}
 	if err := rt.DisableVersion("retfn", "v1"); err != nil {
 		t.Fatal(err)

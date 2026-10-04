@@ -56,11 +56,11 @@ func assertLedger(t *testing.T, business, input string, rt *Runtime, fn, v strin
 	if err != nil {
 		t.Fatalf("[业务:%s] 输入 %s 读取账目失败: %v", business, input, err)
 	}
-	live := int64(st.Pool.Active + st.Pool.Idle + st.Pool.Detached)
+	live := int64(st.Pool.Active + st.Pool.IdleInstances + st.Pool.Detached)
 	if st.Pool.Created-st.Pool.Destroyed != live {
 		t.Fatalf("[业务:%s] 输入 %s 账目不平: created=%d destroyed=%d live(active=%d idle=%d detached=%d)=%d",
 			business, input, st.Pool.Created, st.Pool.Destroyed,
-			st.Pool.Active, st.Pool.Idle, st.Pool.Detached, live)
+			st.Pool.Active, st.Pool.IdleInstances, st.Pool.Detached, live)
 	}
 	return st.Pool
 }
@@ -131,7 +131,7 @@ func TestDrainRejectsNewCompletesInflightAndClearsResources(t *testing.T) {
 	t.Logf("[业务:排空小结] 判定: %+v", sum)
 
 	st := assertLedger(t, "排空资源清零", "dfn/v1", rt, "dfn", "v1")
-	if st.Active != 0 || st.Idle != 0 || st.QueueLength != 0 || st.Detached != 0 {
+	if st.Active != 0 || st.IdleInstances != 0 || st.QueueLength != 0 || st.Detached != 0 {
 		t.Fatalf("排空后资源必须清零，得到 %+v", st)
 	}
 	// 排空结束后再调用，必须以同一原因稳定拒绝。
@@ -173,7 +173,7 @@ func TestDrainInterruptsAfterGracePeriod(t *testing.T) {
 		t.Fatalf("期望中断 1 跑完 0，得到 %+v", sum)
 	}
 	st := assertLedger(t, "中断后账目", "sfn/v1", rt, "sfn", "v1")
-	if st.Active != 0 || st.Idle != 0 {
+	if st.Active != 0 || st.IdleInstances != 0 {
 		t.Fatalf("强制中断后并发/空闲必须归零，得到 %+v", st)
 	}
 	if st.Detached != 1 {
@@ -227,6 +227,12 @@ func TestDrainIdempotentAndConcurrent(t *testing.T) {
 	<-drainEntered
 	// 排空状态先于池切换发布，自旋等待拒绝生效（不与 Drain 抢调度时序）。
 	waitFor(t, func() bool { return rt.currentDrain() != nil }, "drain 状态应已发布")
+	// 池已认领在途调用后再放行：宽限期内自然跑完确定计入 Completed，
+	// 与宽限期调度快慢无关，高负载 -count 反复跑也稳定。
+	waitFor(t, func() bool {
+		st, _ := rt.Stats("ifn2", "v1")
+		return st.Pool.Draining
+	}, "ifn2 池应已进入排空态")
 	h.release()
 	wg.Wait()
 	for i, s := range sums {

@@ -58,7 +58,7 @@ func TestDetachedExecutionIsolationAndLedger(t *testing.T) {
 		return s.Pool.Detached == 0
 	}, "旧执行器迟到返回后应自动收尾")
 	st = assertLedger(t, "迟到返回收尾", "leakfn/v1", rt, "leakfn", "v1")
-	if st.Created != 2 || st.Idle != 1 {
+	if st.Created != 2 || st.IdleInstances != 1 {
 		t.Fatalf("迟到返回后只应多销毁解绑的 inst1，clean-1 的 inst2 应空闲保留，得到 %+v", st)
 	}
 	t.Logf("[业务:自动销毁] 判定: inst1 迟到返回后自动销毁，inst2 空闲保留，clean-1 结论不变，账目自洽")
