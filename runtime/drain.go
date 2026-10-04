@@ -23,51 +23,69 @@ func (rt *Runtime) Drain(gracePeriod time.Duration) DrainSummary {
 	}
 
 	rt.drainClaim.Lock()
-	if d := rt.drain.Load(); d != nil {
+	if existing := rt.drain.Load(); existing != nil {
 		rt.drainClaim.Unlock()
-		<-d.finish
-		return d.summary
+		<-existing.finish
+		return existing.summary
 	}
+
 	d := newDrainState()
-	rt.drain.Store(d) // 先发布：此后任何新提交一律 KindDraining（读路径无锁，不被并发 Drain 饿死）
+
+	// 阶段一：在 admitMu 写锁内完成“认领账本 → 装闸门 → 发布 →
+	// 逐池 beginDrain → 密封准入”。入口的排空判定用同一把锁的
+	// 读临界区完成，因此：
+	//   - 写锁获取时仍在入口读临界区的提交，看到的是旧状态，已登记
+	//     准入，随后被池闸门/清队权威处理，不会漏；
+	//   - 写锁释放后进入入口的提交，必看到 drain 已发布，立即拒绝。
+	rt.admitMu.Lock()
+	rt.mu.Lock()
+	for _, fn := range rt.functions {
+		fn.mu.Lock()
+		for _, pool := range fn.pools {
+			pool.armDrainGate(d)
+		}
+		fn.mu.Unlock()
+	}
+	rt.drain.Store(d)
+	rt.mu.Unlock()
 	rt.drainClaim.Unlock()
 
-	rt.runDrain(d, gracePeriod)
-	return d.summary
-}
-
-func (rt *Runtime) runDrain(d *drainState, gracePeriod time.Duration) {
-	// 1) 所有池进入排空态并在池锁内确定性快照：排队者与在途执行。
-	//    派发与 beginDrain 互斥，因此 flights 快照精确等于
-	//    “排空开始那一刻已真正在执行”的调用集合，不依赖时序。
 	var queued int64
+	var earlyCompleted int64
 	var inflight []*flight
 	for _, fn := range rt.snapshotFunctions() {
 		for _, pool := range fn.snapshotPools() {
-			n, flights := pool.beginDrain()
-			queued += int64(n)
+			n, flights := pool.beginDrain(d)
 			inflight = append(inflight, flights...)
+			queued += int64(n)
+		}
+	}
+	d.sealAndWaitAdmitted()
+	for _, fn := range rt.snapshotFunctions() {
+		for _, pool := range fn.snapshotPools() {
+			pool.mu.Lock()
+			earlyCompleted += int64(pool.drainCompletedEarlyLocked())
+			queued += int64(pool.queuedRejectedEarly)
+			pool.mu.Unlock()
 		}
 	}
 	d.queuedRejected.Store(queued)
 
-	// 2) 宽限期：在途调用全部自然跑完则提前收尾；否则用到点时刻
-	//    仍未关闭 done 的 flight 作为“被中断”集合。
+	// 宽限期放开写锁：新提交在读临界区里立即拒绝并计数。
+	rt.admitMu.Unlock()
+
+	// 阶段二：宽限期。
 	deadline := time.Now().Add(gracePeriod)
-	timedOut := false
-	for len(inflight) > 0 {
-		allDone := make(chan struct{})
-		go func(flights []*flight) {
-			for _, f := range flights {
-				<-f.done
-			}
-			close(allDone)
-		}(inflight)
-		wait := time.Until(deadline)
-		if wait <= 0 {
-			timedOut = true
-			break
+	allDone := make(chan struct{})
+	go func() {
+		for _, f := range inflight {
+			<-f.done
 		}
+		close(allDone)
+	}()
+	wait := time.Until(deadline)
+	timedOut := wait <= 0
+	if !timedOut {
 		timer := time.NewTimer(wait)
 		select {
 		case <-allDone:
@@ -75,23 +93,27 @@ func (rt *Runtime) runDrain(d *drainState, gracePeriod time.Duration) {
 		case <-timer.C:
 			timedOut = true
 		}
-		break // 要么全完，要么到点；到点时未完成的由下一步统一中断
 	}
 
-	// 3) 到点仍未跑完的：强制结论并解绑。解绑是同步的，槽位当场归还，
-	//    不等待执行器响应取消，排空绝不被赖着不走的执行器拖住。
-	var completed, interrupted int64
+	// 到点仍未跑完的：同步强制结论并解绑，槽位当场归还。
+	var interrupted int64
 	if timedOut {
 		for _, f := range inflight {
 			if f.interrupt() {
 				interrupted++
 			}
 		}
-	} else {
-		completed = int64(len(inflight))
 	}
+	// 快照集合是权威划分：每个 flight 最终要么自然结束、要么被中断；
+	// interrupt() 返回 false 即临界点自然结束。跑完 = 快照数 -
+	// 中断数，再补上快照前（闸门安装后）已自然结束的调用。
+	completed := int64(len(inflight)) - interrupted + earlyCompleted
 
-	// 4) 资源清零：空闲实例与定时器全部销毁；active 此刻恒为 0。
+	// 阶段三：收口。重新取写锁——此刻仍在入口读临界区的拒绝调用
+	// 与入口判定串行：Lock 成功后才进入入口的提交严格晚于排空，
+	// 不属于本小结（拒绝原因仍是同一种 KindDraining）。
+	rt.admitMu.Lock()
+
 	var activeLeft, detachedLeft int64
 	for _, fn := range rt.snapshotFunctions() {
 		for _, pool := range fn.snapshotPools() {
@@ -113,6 +135,8 @@ func (rt *Runtime) runDrain(d *drainState, gracePeriod time.Duration) {
 		GracePeriod:       gracePeriod,
 	}
 	close(d.finish)
+	rt.admitMu.Unlock()
+	return d.summary
 }
 
 func (rt *Runtime) snapshotFunctions() []*functionEntry {

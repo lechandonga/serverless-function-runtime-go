@@ -29,6 +29,7 @@ type flight struct {
 	tok         *poolToken
 	mu          sync.Mutex
 	finished    bool
+	natural     bool // complete 赢得终结竞争（自然结束）；false 表示被排空中断
 	done        chan struct{}
 	interruptCh chan struct{}
 }
@@ -45,6 +46,7 @@ func (f *flight) complete(crashed bool) bool {
 		return false
 	}
 	f.finished = true
+	f.natural = true
 	close(f.interruptCh)
 	f.mu.Unlock()
 	f.tok.release(f, crashed)
@@ -66,6 +68,15 @@ func (f *flight) interrupt() bool {
 	f.tok.detach(f)
 	close(f.done)
 	return true
+}
+
+// endedNaturally 必须在 f.done 关闭后调用：该 flight 是否自然结束
+// （而非到点被排空中断）。complete/interrupt 互斥且都只发生一次，
+// 因此这里读到的结论权威、确定。
+func (f *flight) endedNaturally() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.natural
 }
 
 // DrainSummary 是一次排空的小结，便于验证与排查。
@@ -91,40 +102,121 @@ type drainState struct {
 	newRejected    atomic.Int64
 	queuedRejected atomic.Int64
 
+	// admitted 跟踪“排空发布瞬间可能已越过入口检查”的调用：
+	// doInvoke 在 drain 发布前后的临界区 inc，结论确定后 dec。
+	// Drain 收尾前等待 admitted 排空，确保这些调用的拒绝/完成计数
+	// 全部落入小结，小结与调用方可观测到的结论严格一致。
+	admittedMu    sync.Mutex
+	admittedCond  *sync.Cond
+	admittedCount int
+	admitting     bool // false 表示排空已发布，不再接受新的准入登记
+
 	finish  chan struct{} // 排空完成，summary 可读
 	summary DrainSummary
 }
 
 func newDrainState() *drainState {
-	return &drainState{finish: make(chan struct{})}
+	d := &drainState{finish: make(chan struct{}), admitting: true}
+	d.admittedCond = sync.NewCond(&d.admittedMu)
+	return d
+}
+
+// enterAdmission 在 Invoke 排空检查之后登记一次准入。
+// 返回 false 表示排空已经发布：调用方不得登记，直接走排空拒绝。
+// 排空发布与准入判定在同一把锁上，杜绝“检查时 nil、发布后仍执行”的窗口。
+func (d *drainState) enterAdmission() bool {
+	d.admittedMu.Lock()
+	defer d.admittedMu.Unlock()
+	if !d.admitting {
+		return false
+	}
+	d.admittedCount++
+	return true
+}
+
+func (d *drainState) leaveAdmission() {
+	d.admittedMu.Lock()
+	d.admittedCount--
+	if d.admittedCount == 0 {
+		d.admittedCond.Broadcast()
+	}
+	d.admittedMu.Unlock()
+}
+
+// sealAndWaitAdmitted 关闭准入并等待所有已登记调用决出结论。
+// 必须在持有 rt.admitMu 的情况下调用：此刻之后入口的新登记一律
+// 失败（排空拒绝）；而已登记的调用要么已派发（派发点离账、由
+// flights 接管）、要么在队列/resolve 上，会在池闸门处快速结算离账，
+// 因此这里不等待执行器，只等派发决定完成。
+func (d *drainState) sealAndWaitAdmitted() {
+	d.admittedMu.Lock()
+	d.admitting = false
+	for d.admittedCount > 0 {
+		d.admittedCond.Wait()
+	}
+	d.admittedMu.Unlock()
 }
 
 // Invoke 同步调用一个函数。语义见包文档：
 // 超时/排队失败/崩溃等全部归一化为 *PlatformError。
 func (rt *Runtime) Invoke(ctx context.Context, req InvokeRequest) (*InvokeResult, error) {
+	// 排空检查必须先于一切（含幂等回放）：排空开始后，任何提交——
+	// 无论 CallID 是否重复、此前是否成功过、版本是否第一次跑——
+	// 都立即得到同一种排空拒绝，绝不回放旧结论、绝不真正执行。
+	d, errKind := rt.admitOrReject(req)
+	if errKind != nil {
+		return nil, errKind
+	}
 	if req.CallID != "" {
 		entry, first := rt.joinOrCreate(req.CallID)
 		if !first {
+			// 重复提交只是等待既有结论，不占派发额度，立即离开
+			// 准入账本（排空保证此时回放的结论也是合法的；排空后
+			// 的重复提交在顶层入口就已被拒，走不到这里）。
+			d.leaveAdmission()
 			return rt.waitForEntry(ctx, entry)
 		}
-		res, err := rt.doInvoke(ctx, req)
+		res, err := rt.doInvoke(ctx, req, d)
 		rt.finishEntry(req.CallID, entry, res, err)
 		return res, err
 	}
-	return rt.doInvoke(ctx, req)
+	return rt.doInvoke(ctx, req, d)
+}
+
+// admitOrReject 是 Invoke 的入口闸门，在读锁临界区内瞬间完成判定：
+//   - 排空已发布，或准入账本已被 Drain 密封：计数并返回 KindDraining；
+//   - 否则：登记准入，返回本次调用所属账本（结论确定后须离账）。
+//
+// 入口临界区只覆盖判定本身，不覆盖执行；Drain 用同一把互斥锁把
+// “认领→发布→逐池切换→密封”与入口判定串行，杜绝漏拦。
+func (rt *Runtime) admitOrReject(req InvokeRequest) (*drainState, error) {
+	// 入口判定在 admitMu 临界区内瞬间完成（不覆盖执行过程）。
+	rt.admitMu.Lock()
+	defer rt.admitMu.Unlock()
+	if published := rt.drain.Load(); published != nil {
+		// 排空已发布：拒绝并计数。该计数发生在收口写锁的“之前”
+		// 或“之后”由锁严格确定——Drain 收口 Lock 成功后才进入本
+		// 临界区的调用，提交严格晚于排空，不计入本次小结（其拒绝
+		// 原因仍是同一种 KindDraining，承诺不变）。
+		published.newRejected.Add(1)
+		return nil, platformError(KindDraining, req.Function, req.Version,
+			"runtime is draining and accepts no new invocations")
+	}
+	d := rt.admit.Load()
+	if d == nil {
+		d = newDrainState()
+		rt.admit.Store(d)
+	}
+	if !d.enterAdmission() {
+		d.newRejected.Add(1)
+		return nil, platformError(KindDraining, req.Function, req.Version,
+			"runtime is draining and accepts no new invocations")
+	}
+	return d, nil
 }
 
 func (rt *Runtime) currentDrain() *drainState {
 	return rt.drain.Load()
-}
-
-// rejectIfDraining 在排空进行中或已完成时，以统一原因拒绝新提交。
-func (rt *Runtime) rejectIfDraining() bool {
-	if d := rt.currentDrain(); d != nil {
-		d.newRejected.Add(1)
-		return true
-	}
-	return false
 }
 
 func (rt *Runtime) joinOrCreate(callID string) (*idempotentEntry, bool) {
@@ -154,16 +246,11 @@ func (rt *Runtime) finishEntry(callID string, e *idempotentEntry, res *InvokeRes
 	close(e.done)
 }
 
-func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest) (*InvokeResult, error) {
+func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest, admission *drainState) (*InvokeResult, error) {
 	started := time.Now()
-
-	if rt.rejectIfDraining() {
-		return nil, platformError(KindDraining, req.Function, req.Version,
-			"runtime is draining and accepts no new invocations")
-	}
-
 	rev, pool, err := rt.resolve(req.Function, req.Version)
 	if err != nil {
+		admission.leaveAdmission()
 		return nil, err
 	}
 
@@ -173,8 +260,13 @@ func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest) (*InvokeR
 	}
 	defer cancel()
 
-	f, err := pool.acquire(ctx)
+	f, err := pool.acquire(ctx, admission.leaveAdmission)
 	if err != nil {
+		// 排队路径已在入队时 leave；只有非排队错误（resolve 失败、
+		// 闸门直拒、过载、入队前取消）需要在这里 leave。
+		if !errors.Is(err, drainingQueuedSentinel) {
+			admission.leaveAdmission()
+		}
 		if errors.Is(err, drainingQueuedSentinel) {
 			// 排空清队：排队拒绝数已由 beginDrain 权威统计，这里只归一化结论。
 			return nil, platformError(KindDraining, req.Function, rev.spec.Version,
@@ -188,6 +280,8 @@ func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest) (*InvokeR
 		}
 		return nil, err // 过载等已归一化错误
 	}
+	// 已真正派发：脱离准入账本，后续由 flight + 宽限期接管。
+	admission.leaveAdmission()
 
 	tok := f.tok
 	out := make(chan invokeOutcome, 1)
@@ -196,9 +290,8 @@ func (rt *Runtime) doInvoke(parent context.Context, req InvokeRequest) (*InvokeR
 		out <- runHandler(tok.inst.handler, ctx, req.Payload)
 	}()
 
-	// 排空宽限截止时刻：drain 在另一个 goroutine 里到点写入并唤醒。
-	// drain 尚未发生时 deadlineCh 为 nil，select 不会选中它；
-	// drain 到点时若本调用仍在跑，由 drain 方直接 interrupt 本 flight。
+	// drain 到点时若本调用仍在跑，由 drain 方直接 interrupt 本 flight，
+	// interruptCh 关闭；自然结束则由 complete 先关闭它。
 	select {
 	case <-f.interruptCh:
 		// 排空宽限期到点（drain 方同步完成解绑）：结论固定为排空中断，

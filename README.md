@@ -17,8 +17,14 @@ go test -count=1 ./...
 # 竞态检测 + 反复跑（并发用例全部基于屏障同步，不赌时序）
 CGO_ENABLED=1 go test -race -count=10 ./...
 
-# 只看本轮新增能力的用例
-go test -race -v -run 'TestDrain|TestDetached|TestMaxIdleInstances|TestVersionRetirement' ./...
+# 只看排空与兼容相关用例
+go test -race -v -run 'TestDrain|TestStatsIdleBool' ./...
+```
+
+不装 C 工具链时的最小验证：
+
+```bash
+go test -count=1 -run TestDrain ./...
 ```
 
 ## 错误类别（稳定可判定，与错误文本无关）
@@ -48,10 +54,15 @@ summary := rt.Drain(5 * time.Second) // 阻塞到排空完成，最多等宽限�
 
 - **停止接单**：排空状态先发布，此后任何新提交立即返回 `Draining`；
   排空完成后再调用也以同一原因稳定拒绝（运行时此后不再接单）。
+  判定先于一切处理：**带已成功 CallID 的重复提交也返回 `Draining`，
+  绝不回放旧结论**；此前从未执行过的新版本首批调用同样被拦，不存在
+  “排空已返回、调用还在跑”的漏网窗口。
 - **队列直拒**：排空开始时仍在队列、尚未真正执行的调用，立即以
   `Draining` 结束，不占用宽限期。
-- **在途跑完**：排空开始时已真正在执行的调用可以把宽限期用满，
+- **在途跑完**：排空闸门安装时已真正在执行的调用可以把宽限期用满，
   宽限期内自然结束的计入 `Completed`，结论就是执行器的真实结果。
+  自然结束既包括成功，也包括业务错误与 panic 后兜底，以及调用自身
+  超时/取消——只要拿到的是真实执行结论就算“跑完”。
 - **到点强制中断**：宽限期到点仍未结束的调用，立即得到
   `DrainInterrupted`；其执行载体在同一时刻同步解绑、并发槽当场归还。
   **即使执行器完全不响应 `ctx.Done()`，排空也按时收尾，不会被拖住**；
@@ -65,13 +76,23 @@ summary := rt.Drain(5 * time.Second) // 阻塞到排空完成，最多等宽限�
 
 | 字段 | 含义 |
 | --- | --- |
-| `Completed` | 在宽限期内自然跑完的在途调用数 |
-| `Interrupted` | 到点被强制中断的在途调用数 |
-| `QueuedRejected` | 排空开始时仍排队、被直接结束的调用数 |
-| `NewRejected` | 排空开始后尝试新提交被拒的调用数（尽力统计） |
+| `Completed` | 排空负责的在途调用中，拿到真实执行结论（自然结束）的数量。等于“在途快照数 − 中断数”，再补上闸门安装后、快照前已结束的调用；任何时刻结束都不漏计、不双计 |
+| `Interrupted` | 宽限期到点仍未结束、被强制给出 `DrainInterrupted` 的数量。`Completed + Interrupted` 恒等于排空闸门安装时已在执行的调用总数 |
+| `QueuedRejected` | 排空开始时仍在队列（含闸门安装后、在途快照前在队列中被拒派发）的调用数，统一得到 `Draining` |
+| `NewRejected` | 排空发布后到排空收口之间的新提交拒绝数（重复 CallID、首次执行一视同仁），与 `QueuedRejected` 互斥不重叠 |
 | `RemainingActive` | 收尾时仍占并发槽的执行数（恒为 0） |
 | `RemainingDetached` | 收尾时已解绑、但后台执行器尚未返回的载体数 |
 | `GracePeriod` | 本次宽限期 |
+
+计数边界一览：
+
+| 调用结局 | 归类 |
+| --- | --- |
+| 闸门安装前已自然结束 | 排空未参与，不计入小结（资源已按正常路径入账） |
+| 闸门安装后、宽限期内自然结束（成功/业务失败/panic/自身超时取消） | `Completed` |
+| 宽限期到点仍未结束 | `Interrupted` + 错误 `DrainInterrupted` |
+| 排空开始时仍在队列等待 | `QueuedRejected` + 错误 `Draining` |
+| 排空发布后提交（CallID 重复与否、版本首次与否） | `NewRejected` + 错误 `Draining` |
 
 `Close()` 保持历史语义：只标记关闭并回收空闲资源，不强制中断在途调用。
 需要“先排空再退出”的常驻服务用 `Drain`。
@@ -93,7 +114,10 @@ summary := rt.Drain(5 * time.Second) // 阻塞到排空完成，最多等宽限�
 Created - Destroyed == Active + Idle + Detached
 ```
 
-`Stats`：`Active`（正在执行）、`Idle`（空闲实例数）、`Detached`
+`Stats`：`Active`（正在执行）、`Idle`（**布尔值**：该版本当前是否
+存在至少一个空闲实例，历史语义保持不变，老脚本可直接 `if st.Idle`）、
+`IdleCount`（空闲实例的具体数量，需要数量的新代码使用本字段）、
+`Detached`
 （已解绑未收尾）、`QueueLength`、`Created`、`Destroyed`、`Retired`、`Draining`。
 
 ## 3. 空闲实例保留策略与版本退场回收
@@ -119,3 +143,6 @@ Created - Destroyed == Active + Idle + Detached
 - 不引入任何外部依赖，仍只用标准库；所有语义在当前进程内生效。
 - 既有配置（不填 `MaxIdleInstances`）、错误类别、路由/幂等/排队/超时
   语义保持不变；`Close()` 行为保持不变。
+- `Stats.Idle` 恢复为历史 **布尔** 字段（“有无空闲实例”），老调用方
+  升级后无需改代码即可继续编译与按条件判断；空闲实例的具体数量改用
+  新增字段 `Stats.IdleCount`。

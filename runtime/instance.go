@@ -42,6 +42,21 @@ type instancePool struct {
 	flights  map[*flight]struct{} // 已真正派发、仍在途的调用
 	retired  bool                 // 版本退场（停用/不再是当前版本）：跑完即回收
 	draining bool
+	// drainGate 在排空状态正式发布前安装（持函数锁），此后该池看到的
+	// “排空已经开始”不依赖 beginDrain 是否已经轮到本池：
+	// 闸门安装后到 beginDrain 快照之间自然结束的调用也会被计入排空小结，
+	// 其载体不会回到空闲池。
+	drainGate atomic.Pointer[drainState]
+	// drainSnapshotted 为 true 表示 beginDrain 已经完成在途快照。
+	drainSnapshotted bool
+	// queuedRejectedEarly：闸门安装之后、在途快照之前，已在队列中
+	// 等待、被闸门拒绝派发的调用数。与快照时仍在队列的等待者共同
+	// 构成 QueuedRejected，权威计数、不依赖各调用方自行累加。
+	queuedRejectedEarly int
+	// drainCompleted 在池锁内维护：闸门安装之后、在途快照之前自然
+	// 结束的在途调用数。这些调用已不在快照 flights 里，单列以免漏计；
+	// 快照之后结束的调用直接从快照 flight 集合上判定，不再累加。
+	drainCompleted int
 
 	created   atomic.Int64
 	destroyed atomic.Int64
@@ -59,6 +74,20 @@ type waiter struct {
 	ctx     context.Context
 	dead    bool
 	drained bool // 被排空清队：拒绝数由池方权威统计，调用方不再累加
+	// settle 在排队结论确定（派发/拒绝/取消）时调用一次：
+	// 让调用离开排空准入账本。幂等。
+	settle      func()
+	settledOnce bool
+}
+
+// markSettled 要求持有池锁：幂等地标记“结论已确定”，返回是否
+// 需要由调用方在锁外真正执行 settle（避免在池锁内拿准入账本锁）。
+func (w *waiter) markSettled() bool {
+	if w.settle == nil || w.settledOnce {
+		return false
+	}
+	w.settledOnce = true
+	return true
 }
 
 type poolToken struct {
@@ -79,23 +108,56 @@ func (p *instancePool) maxIdle() int {
 	return 1
 }
 
+// armDrainGate 在排空状态发布前安装闸门。要求持有函数锁，
+// 与 resolve 的懒建池互斥，杜绝“排空枚举之后才诞生的新池”。
+func (p *instancePool) armDrainGate(d *drainState) {
+	p.drainGate.Store(d)
+}
+
 // beginDrain 进入排空态：不再派发，并立即清空等待队列。
 // 被清除的等待者由 acquire 侧按排空原因结束。可重复、可并发调用。
-func (p *instancePool) beginDrain() (queued int, flights []*flight) {
+// d 必须是已经 arm 到本池闸门上的同一个 drainState。
+func (p *instancePool) beginDrain(d *drainState) (queued int, flights []*flight) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.drainGate.Load() == nil {
+		p.drainGate.Store(d)
+	}
 	p.draining = true
-	queued = len(p.waiters)
 	for _, w := range p.waiters {
+		// 已经自行超时/取消退出的等待者不计入排空拒绝：
+		// 它拿到的是 QueueTimeout/Canceled，不是排空结论。
+		if w.dead {
+			continue
+		}
+		queued++
 		w.dead = true
 		w.drained = true
-		close(w.ch)
+		if d := p.drainGate.Load(); d != nil {
+			// 直接在排空账本上离账：等待者此后只负责接收唤醒，
+			// seal 不必等它；计数已权威计入 queued。
+			d.leaveAdmission()
+		}
+		w.markSettled()
+		close(w.ch) // 未取消的等待者的 ch 尚未关闭
 	}
 	p.waiters = nil
 	for f := range p.flights {
 		flights = append(flights, f)
 	}
+	p.drainSnapshotted = true
 	return queued, flights
+}
+
+// drainCompletedEarlyLocked 要求持有 mu：返回“快照前自然结束”的调用数。
+func (p *instancePool) drainCompletedEarlyLocked() int { return p.drainCompleted }
+
+// markQueuedRejectedEarly 要求持有 mu：登记一笔“闸门后、快照前
+// 在队列中被拒绝派发”的调用，统一计入排空小结 QueuedRejected。
+func (p *instancePool) markQueuedRejectedEarly() {
+	if p.drainGate.Load() != nil && !p.draining {
+		p.queuedRejectedEarly++
+	}
 }
 
 // retire 标记版本退场：空闲实例立即回收，在途调用跑完后不再保留。
@@ -108,11 +170,15 @@ func (p *instancePool) retire() {
 
 // acquire 在 ctx 截止/取消前取得一个实例。
 // 返回的 token 必须且只能终结一次（release 或 detach）。
-func (p *instancePool) acquire(ctx context.Context) (*flight, error) {
+func (p *instancePool) acquire(ctx context.Context, onQueued func()) (*flight, error) {
 	spec := p.rev.spec
 
 	p.mu.Lock()
-	if p.draining {
+	drainingNow := p.draining || p.drainGate.Load() != nil
+	if drainingNow {
+		if d := p.drainGate.Load(); d != nil {
+			d.newRejected.Add(1)
+		}
 		err := platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
 		p.mu.Unlock()
 		return nil, err
@@ -129,7 +195,7 @@ func (p *instancePool) acquire(ctx context.Context) (*flight, error) {
 		p.mu.Unlock()
 		return nil, err
 	}
-	w := &waiter{ch: make(chan struct{}), ctx: ctx}
+	w := &waiter{ch: make(chan struct{}), ctx: ctx, settle: onQueued}
 	p.waiters = append(p.waiters, w)
 	p.mu.Unlock()
 
@@ -137,36 +203,78 @@ func (p *instancePool) acquire(ctx context.Context) (*flight, error) {
 	case <-w.ch:
 		// release/drain 方唤醒后，这里再次持锁检查并创建/复用实例。
 		p.mu.Lock()
+		settled := false
 		if w.dead {
 			draining := p.draining
 			drained := w.drained
-			p.mu.Unlock()
+			gate := p.drainGate.Load()
 			if draining && drained {
+				settled = w.markSettled()
+				p.mu.Unlock()
+				if settled {
+					w.settle()
+				}
 				return nil, drainingQueuedSentinel
 			}
-			if draining {
+			if draining || gate != nil {
+				// 闸门已装、快照前被其他事件唤醒判死的排队者：
+				// 未获派发，计入 QueuedRejected（快照前那一笔）。
+				if gate != nil && !drained {
+					p.queuedRejectedEarly++
+				}
+				settled = w.markSettled()
+				p.mu.Unlock()
+				if settled {
+					w.settle()
+				}
 				return nil, platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
 			}
 			// 极端竞态：等待者已超时退出，槽位没有真正交给它。
+			settled = w.markSettled()
+			p.mu.Unlock()
+			if settled {
+				w.settle()
+			}
 			return nil, ctx.Err()
 		}
-		if p.draining {
+		// 闸门已装（无论 beginDrain 是否已到）：排队者不得派发。
+		// 计数由 drain 方在池锁内权威完成（快照时仍在队列的算
+		// QueuedRejected；快照前被拒绝的由本池 queuedRejectedEarly 记录），
+		// 这里只归一化结论。
+		if p.draining || p.drainGate.Load() != nil {
+			p.markQueuedRejectedEarly()
+			settled = w.markSettled()
 			p.mu.Unlock()
-			return nil, platformError(KindDraining, "", spec.Version, "runtime is draining and accepts no new invocations")
+			if settled {
+				w.settle()
+			}
+			return nil, drainingQueuedSentinel
 		}
 		f, ok := p.tryDispatchLocked()
 		if !ok {
 			// 理论不可达：被唤醒必然有空闲槽；保守处理为过载。
+			settled = w.markSettled()
 			p.mu.Unlock()
+			if settled {
+				w.settle()
+			}
 			return nil, platformError(KindOverload, "", spec.Version, "woken but no slot available")
 		}
+		settled = w.markSettled()
 		p.mu.Unlock()
+		if settled {
+			w.settle()
+		}
 		return f, nil
 	case <-ctx.Done():
 		p.mu.Lock()
 		w.dead = true
+		settled := w.markSettled()
 		p.removeWaiterLocked(w)
 		p.mu.Unlock()
+		if settled {
+			w.settle()
+		}
 		return nil, ctx.Err()
 	}
 }
@@ -228,7 +336,17 @@ func (p *poolToken) release(f *flight, crashed bool) {
 	pool.active--
 	delete(pool.flights, f)
 
-	reuse := !crashed && !pool.retired && !pool.draining
+	draining := pool.draining || pool.drainGate.Load() != nil
+	// 闸门安装之后自然结束的在途调用计入排空小结（无论成功、业务失败
+	// 还是 panic，只要拿到的是真实执行结论就算“跑完”）。闸门在
+	// beginDrain 之前安装，因此安装到快照之间结束的调用也不会漏计。
+	if draining {
+		// 快照之后结束的调用在快照集合上直接判定，避免重复计数。
+		if !pool.drainSnapshotted {
+			pool.drainCompleted++
+		}
+	}
+	reuse := !crashed && !pool.retired && !draining
 	spec := pool.rev.spec
 	if reuse {
 		// IdleTimeout=0 表示立即回收；显式 maxIdle=0 表示不保留；
@@ -332,8 +450,11 @@ func (p *instancePool) dropAllIdleLocked() {
 
 // Stats 供测试与可观测性使用。
 type Stats struct {
-	Active      int
-	Idle        int
+	Active int
+	// Idle 保持历史布尔语义：该版本当前是否存在至少一个空闲实例。
+	// 老调用方可以直接 `if st.Idle` 条件判断，升级不破坏源码兼容。
+	Idle        bool
+	IdleCount   int // 空闲实例的具体数量；需要数量的新代码请使用本字段
 	Detached    int
 	QueueLength int
 	Created     int64
@@ -354,7 +475,8 @@ func (p *instancePool) stats() Stats {
 	}
 	return Stats{
 		Active:      p.active,
-		Idle:        idle,
+		Idle:        idle > 0,
+		IdleCount:   idle,
 		Detached:    p.detached,
 		QueueLength: len(p.waiters),
 		Created:     p.created.Load(),

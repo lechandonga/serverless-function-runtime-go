@@ -34,6 +34,8 @@ type Runtime struct {
 
 	drainClaim sync.Mutex
 	drain      atomic.Pointer[drainState] // 非 nil 表示正在排空或已完成排空（此后永久拒绝新调用）
+	admitMu    sync.Mutex
+	admit      atomic.Pointer[drainState] // 准入账本：调用越过入口检查时登记，排空认领时密封复用
 
 	closeOnce sync.Once
 	closed    bool
@@ -52,6 +54,9 @@ func (rt *Runtime) Register(name string, spec VersionSpec) error {
 	defer rt.mu.Unlock()
 	if rt.closed {
 		return platformError(KindValidation, name, spec.Version, "runtime is closed")
+	}
+	if rt.drain.Load() != nil {
+		return platformError(KindDraining, name, spec.Version, "runtime is draining and accepts no new functions")
 	}
 	if _, ok := rt.functions[name]; ok {
 		return platformError(KindValidation, name, spec.Version, "function already registered")
@@ -83,6 +88,9 @@ func (rt *Runtime) Publish(name string, spec VersionSpec) error {
 	}
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
+	if rt.drain.Load() != nil {
+		return platformError(KindDraining, name, spec.Version, "runtime is draining and accepts no new versions")
+	}
 	if _, ok := fn.revisions[spec.Version]; ok {
 		return platformError(KindValidation, name, spec.Version, "version already exists")
 	}
@@ -165,6 +173,12 @@ func (rt *Runtime) resolve(name string, v Version) (*Revision, *instancePool, er
 	}
 	pool, ok := fn.pools[v]
 	if !ok {
+		// 排空期间禁止懒建池：Drain 装闸门时持本函数写锁，与这里互斥；
+		// 排空状态发布之后才走到这里的调用一律拒绝，新池不可能绕过闸门。
+		if d := rt.drain.Load(); d != nil {
+			d.newRejected.Add(1)
+			return nil, nil, platformError(KindDraining, name, v, "runtime is draining and accepts no new invocations")
+		}
 		pool = newInstancePool(rev)
 		fn.pools[v] = pool
 	}
